@@ -12,15 +12,14 @@
 #include <flutter/texture_registrar.h>
 
 #include <cstdint>
-#include <mutex>
 #include <memory>
-#include <thread>
+#include <mutex>
 #include <unordered_map>
-#include <vector>
 
 namespace vlc_player {
 
 class WindowsVlcPlayer;
+class WindowsPlayerTaskRunner;
 
 class VlcPlayerPlugin : public flutter::Plugin {
  public:
@@ -53,10 +52,10 @@ class VlcPlayerPlugin : public flutter::Plugin {
   flutter::TextureRegistrar *texture_registrar_;
   FlutterDesktopMessengerRef messenger_ref_;
   int64_t next_view_id_ = 1;
+  bool shutting_down_ = false;
   std::mutex players_mutex_;
   std::unordered_map<int64_t, std::shared_ptr<WindowsVlcPlayer>> players_;
-  std::vector<std::thread> create_threads_;
-  std::vector<std::thread> dispose_threads_;
+  std::unique_ptr<WindowsPlayerTaskRunner> task_runner_;
 };
 
 }  // namespace vlc_player

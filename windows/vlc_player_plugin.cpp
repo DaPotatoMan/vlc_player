@@ -3,8 +3,6 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
-
 #include <flutter/event_channel.h>
 #include <flutter/event_sink.h>
 #include <flutter/event_stream_handler_functions.h>
@@ -14,11 +12,14 @@
 #include <flutter/texture_registrar.h>
 #include <flutter_messenger.h>
 #include <flutter_plugin_registrar.h>
+#include <windows.h>
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "vlc_player_core.h"
+#include "windows_player_task_runner.h"
 
 namespace vlc_player {
 namespace {
@@ -281,6 +283,40 @@ EncodableMap MediaStats(const VlcMediaStats &stats) {
 
 }  // namespace
 
+// Raster callbacks may outlive the player while Flutter unregisters a texture.
+// Keep the callback state, and each returned pixel buffer's core, alive until
+// Flutter acknowledges their release.
+struct WindowsVlcTextureState {
+  struct Frame {
+    std::shared_ptr<VlcPlayerCore> core;
+    FlutterDesktopPixelBuffer pixels = {};
+  };
+
+  const FlutterDesktopPixelBuffer *CopyPixelBuffer() {
+    auto current_core = std::atomic_load(&core);
+    if (!current_core) {
+      return nullptr;
+    }
+    const uint8_t *buffer = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!current_core->CopyPixels(&buffer, &width, &height)) {
+      return nullptr;
+    }
+    auto *frame = new Frame{std::move(current_core), {}};
+    frame->pixels.buffer = buffer;
+    frame->pixels.width = width;
+    frame->pixels.height = height;
+    frame->pixels.release_callback = [](void *context) {
+      delete static_cast<Frame *>(context);
+    };
+    frame->pixels.release_context = frame;
+    return &frame->pixels;
+  }
+
+  std::shared_ptr<VlcPlayerCore> core;
+};
+
 class WindowsVlcPlayer {
  public:
   WindowsVlcPlayer(int64_t view_id, flutter::BinaryMessenger *messenger,
@@ -312,9 +348,9 @@ class WindowsVlcPlayer {
             });
     event_channel_.SetStreamHandler(std::move(stream_handler));
 
-    texture_ = std::make_unique<flutter::TextureVariant>(
-        flutter::PixelBufferTexture([this](size_t width, size_t height) {
-          return CopyPixelBuffer(width, height);
+    texture_ = std::make_shared<flutter::TextureVariant>(
+        flutter::PixelBufferTexture([state = texture_state_](size_t, size_t) {
+          return state->CopyPixelBuffer();
         }));
     texture_id_ = texture_registrar_->RegisterTexture(texture_.get());
     if (texture_id_ == -1) {
@@ -324,10 +360,10 @@ class WindowsVlcPlayer {
 
   void Initialize(const std::vector<std::string> &options) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    if (!init_error_.empty() || disposed_.load()) {
+    if (!init_error_.empty() || disposed_.load() || flutter_detached_.load()) {
       return;
     }
-    core_ = std::make_unique<VlcPlayerCore>(options, [this] {
+    core_ = std::make_shared<VlcPlayerCore>(options, [this] {
       if (!disposed_.load() && texture_id_ != -1) {
         texture_registrar_->MarkTextureFrameAvailable(texture_id_);
       }
@@ -336,14 +372,23 @@ class WindowsVlcPlayer {
       init_error_ = core_->error();
       return;
     }
+    if (flutter_detached_.load()) {
+      return;
+    }
 
+    std::atomic_store(&texture_state_->core, core_);
     polling_ = true;
     polling_thread_ = std::thread([this] {
-      while (polling_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::unique_lock<std::mutex> lock(polling_mutex_);
+      while (
+          !polling_condition_.wait_for(lock, std::chrono::milliseconds(500),
+                                       [this] { return !polling_.load(); })) {
+        lock.unlock();
         SendSnapshot(true);
+        lock.lock();
       }
     });
+    initialized_ = true;
   }
 
   ~WindowsVlcPlayer() {
@@ -351,9 +396,7 @@ class WindowsVlcPlayer {
     DisposeCore();
   }
 
-  bool is_valid() const {
-    return init_error_.empty() && texture_id_ != -1 && core_ != nullptr;
-  }
+  bool is_valid() const { return initialized_.load(); }
   const std::string &error() const { return init_error_; }
   int64_t texture_id() const { return texture_id_; }
 
@@ -447,7 +490,11 @@ class WindowsVlcPlayer {
       std::lock_guard<std::mutex> lock(event_mutex_);
       event_sink_.reset();
     }
-    event_channel_.SetStreamHandler(nullptr);
+    // The engine can invalidate its messenger before destroying its plugins.
+    if (messenger_ref_ == nullptr ||
+        FlutterDesktopMessengerIsAvailable(messenger_ref_)) {
+      event_channel_.SetStreamHandler(nullptr);
+    }
   }
 
   void DisposeCore() {
@@ -455,20 +502,25 @@ class WindowsVlcPlayer {
       return;
     }
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    polling_ = false;
+    {
+      std::lock_guard<std::mutex> polling_lock(polling_mutex_);
+      polling_ = false;
+    }
+    polling_condition_.notify_one();
     if (polling_thread_.joinable()) {
       polling_thread_.join();
     }
 
+    std::atomic_store(&texture_state_->core, std::shared_ptr<VlcPlayerCore>());
     if (core_ != nullptr) {
       core_->Dispose();
       core_.reset();
     }
     if (texture_id_ != -1) {
-      texture_registrar_->UnregisterTexture(texture_id_);
+      texture_registrar_->UnregisterTexture(texture_id_,
+                                            [texture = std::move(texture_)] {});
       texture_id_ = -1;
     }
-    texture_.reset();
   }
 
  private:
@@ -477,25 +529,6 @@ class WindowsVlcPlayer {
     const std::string error = operation();
     SendSnapshot();
     return error;
-  }
-
-  const FlutterDesktopPixelBuffer *CopyPixelBuffer(size_t width,
-                                                   size_t height) {
-    if (core_ == nullptr) {
-      return nullptr;
-    }
-    const uint8_t *buffer = nullptr;
-    uint32_t pixel_width = 0;
-    uint32_t pixel_height = 0;
-    if (!core_->CopyPixels(&buffer, &pixel_width, &pixel_height)) {
-      return nullptr;
-    }
-    pixel_buffer_.buffer = buffer;
-    pixel_buffer_.width = pixel_width;
-    pixel_buffer_.height = pixel_height;
-    pixel_buffer_.release_callback = nullptr;
-    pixel_buffer_.release_context = nullptr;
-    return &pixel_buffer_;
   }
 
   void SendSnapshot(bool lock_messenger = false, bool force = false) {
@@ -575,17 +608,21 @@ class WindowsVlcPlayer {
   bool has_last_sent_snapshot_ = false;
   VlcSnapshot last_sent_snapshot_;
 
-  std::unique_ptr<VlcPlayerCore> core_;
+  std::shared_ptr<VlcPlayerCore> core_;
   std::string init_error_;
+  std::atomic<bool> initialized_ = false;
   std::atomic<bool> disposed_ = false;
   std::atomic<bool> flutter_detached_ = false;
   std::mutex lifecycle_mutex_;
   std::atomic<bool> polling_ = false;
+  std::mutex polling_mutex_;
+  std::condition_variable polling_condition_;
   std::thread polling_thread_;
 
-  std::unique_ptr<flutter::TextureVariant> texture_;
+  std::shared_ptr<WindowsVlcTextureState> texture_state_ =
+      std::make_shared<WindowsVlcTextureState>();
+  std::shared_ptr<flutter::TextureVariant> texture_;
   int64_t texture_id_ = -1;
-  FlutterDesktopPixelBuffer pixel_buffer_ = {};
 };
 
 // static
@@ -627,23 +664,25 @@ VlcPlayerPlugin::VlcPlayerPlugin(flutter::BinaryMessenger *messenger,
                                  FlutterDesktopMessengerRef messenger_ref)
     : messenger_(messenger),
       texture_registrar_(texture_registrar),
-      messenger_ref_(messenger_ref) {}
+      messenger_ref_(messenger_ref),
+      task_runner_(std::make_unique<WindowsPlayerTaskRunner>()) {}
 
 VlcPlayerPlugin::~VlcPlayerPlugin() {
-  for (auto &thread : create_threads_) {
-    if (thread.joinable()) {
-      thread.join();
-    }
-  }
-  for (auto &thread : dispose_threads_) {
-    if (thread.joinable()) {
-      thread.join();
-    }
-  }
+  shutting_down_ = true;
   {
     std::lock_guard<std::mutex> lock(players_mutex_);
+    for (const auto &entry : players_) {
+      entry.second->DetachFromFlutter();
+      task_runner_->PostWorkerTask(
+          [player = entry.second] { player->DisposeCore(); });
+    }
     players_.clear();
   }
+  // The worker never waits for the platform thread. Drain VLC teardown first,
+  // then complete any pending create replies while this plugin is still alive.
+  task_runner_->Shutdown();
+  task_runner_->RunPlatformTasks();
+  task_runner_.reset();
   if (messenger_ref_ != nullptr) {
     FlutterDesktopMessengerRelease(messenger_ref_);
     messenger_ref_ = nullptr;
@@ -656,6 +695,11 @@ void VlcPlayerPlugin::HandleMethodCall(
   const auto *arguments = std::get_if<EncodableMap>(method_call.arguments());
 
   if (method_call.method_name() == "create") {
+    if (!task_runner_->is_valid()) {
+      result->Error("create_failed",
+                    "Unable to create the vlc_player platform task window.");
+      return;
+    }
     const auto options = arguments == nullptr
                              ? std::vector<std::string>()
                              : ReadStringList(*arguments, "options");
@@ -675,40 +719,45 @@ void VlcPlayerPlugin::HandleMethodCall(
       std::lock_guard<std::mutex> lock(players_mutex_);
       players_[view_id] = player;
     }
-    create_threads_.emplace_back(
-        [this, view_id, options, player,
-         result = std::move(result)]() mutable {
-          player->Initialize(options);
-          if (!player->is_valid()) {
-            const std::string error = player->error();
+    auto pending_result =
+        std::shared_ptr<flutter::MethodResult<EncodableValue>>(
+            std::move(result));
+    task_runner_->PostWorkerTask(
+        [this, view_id, options, player, result = std::move(pending_result)] {
+          std::string error;
+          try {
+            player->Initialize(options);
+            if (!player->is_valid()) {
+              error = player->error();
+            }
+          } catch (const std::exception &failure) {
+            error = failure.what();
+          }
+          const bool valid = error.empty() && player->is_valid();
+          const int64_t texture_id = player->texture_id();
+          task_runner_->PostPlatformTask([this, view_id, player, result, error,
+                                          valid, texture_id] {
+            bool still_present = false;
             {
               std::lock_guard<std::mutex> lock(players_mutex_);
               const auto it = players_.find(view_id);
-              if (it != players_.end() && it->second == player) {
-                players_.erase(it);
-              }
+              still_present = it != players_.end() && it->second == player;
             }
-            player->DetachFromFlutter();
-            player->DisposeCore();
-            result->Error("create_failed", error);
-            return;
-          }
-
-          const int64_t texture_id = player->texture_id();
-          {
-            std::lock_guard<std::mutex> lock(players_mutex_);
-            const auto it = players_.find(view_id);
-            if (it == players_.end() || it->second != player) {
+            if (shutting_down_ || !still_present) {
               result->Error("player_not_found",
                             "The vlc_player was disposed during creation.");
               return;
             }
-          }
-
-          EncodableMap response;
-          response[EncodableValue("viewId")] = EncodableValue(view_id);
-          response[EncodableValue("textureId")] = EncodableValue(texture_id);
-          result->Success(EncodableValue(response));
+            if (!valid) {
+              DisposePlayer(view_id);
+              result->Error("create_failed", error);
+              return;
+            }
+            EncodableMap response;
+            response[EncodableValue("viewId")] = EncodableValue(view_id);
+            response[EncodableValue("textureId")] = EncodableValue(texture_id);
+            result->Success(EncodableValue(response));
+          });
         });
     return;
   }
@@ -882,6 +931,10 @@ std::shared_ptr<WindowsVlcPlayer> VlcPlayerPlugin::FindPlayer(
                       std::to_string(view_id) + ".");
     return nullptr;
   }
+  if (!it->second->is_valid()) {
+    result->Error("player_not_ready", "The vlc_player is still being created.");
+    return nullptr;
+  }
   return it->second;
 }
 
@@ -899,9 +952,8 @@ void VlcPlayerPlugin::DisposePlayer(int64_t view_id) {
     return;
   }
   player->DetachFromFlutter();
-  dispose_threads_.emplace_back([player = std::move(player)] {
-    player->DisposeCore();
-  });
+  task_runner_->PostWorkerTask(
+      [player = std::move(player)] { player->DisposeCore(); });
 }
 
 }  // namespace vlc_player

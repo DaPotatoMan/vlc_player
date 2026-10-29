@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Moved Windows VLC initialization and teardown off the platform thread while
+  keeping Flutter channel cleanup on the platform thread.
+- Reused a lifecycle worker instead of retaining a thread handle for each
+  player creation and disposal, and kept textures alive until Flutter finishes
+  unregistering them.
+
+### Added
+
+- Added Windows lifecycle regression coverage for failed initialization,
+  overlapping creation and disposal, repeated use, and shutdown.
+
 ## 2.1.3 - 2026-06-02
 
 ### Changed

@@ -75,9 +75,7 @@ void main() {
       tester,
       () => controller.isAttached,
       description: 'native player attachment',
-      // Async Windows initialization keeps frames running during a cold VLC
-      // plugin scan, which can exceed the old ten-second polling window.
-      attempts: Platform.isWindows ? 480 : 40,
+      attempts: nativePlayerAttachmentAttempts,
     );
     expect(controller.isAttached, isTrue);
     expect(tester.takeException(), isNull);

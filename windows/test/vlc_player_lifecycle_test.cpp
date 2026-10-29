@@ -1,6 +1,7 @@
 #include <flutter/binary_messenger.h>
 #include <flutter/method_call.h>
 #include <flutter/method_result_functions.h>
+#include <flutter/standard_method_codec.h>
 #include <flutter/texture_registrar.h>
 #include <gtest/gtest.h>
 #include <windows.h>
@@ -43,21 +44,48 @@ bool PumpUntil(const std::function<bool()>& ready) {
 class TestMessenger : public flutter::BinaryMessenger {
  public:
   void Send(const std::string&, const uint8_t*, size_t,
-            flutter::BinaryReply) const override {}
+            flutter::BinaryReply) const override {
+    if (std::this_thread::get_id() != platform_thread_) {
+      ++off_platform_sends;
+    }
+    ++sent_events;
+  }
 
-  void SetMessageHandler(const std::string&,
+  void SetMessageHandler(const std::string& channel,
                          flutter::BinaryMessageHandler handler) override {
     if (std::this_thread::get_id() != platform_thread_) {
       ++off_platform_updates;
     }
     active_handlers += handler ? 1 : -1;
+    std::lock_guard<std::mutex> lock(handler_mutex_);
+    if (handler) {
+      handlers_[channel] = std::move(handler);
+    } else {
+      handlers_.erase(channel);
+    }
+  }
+
+  void Listen(const std::string& channel) {
+    const auto message =
+        flutter::StandardMethodCodec::GetInstance().EncodeMethodCall(
+            flutter::MethodCall<EncodableValue>("listen", nullptr));
+    flutter::BinaryMessageHandler handler;
+    {
+      std::lock_guard<std::mutex> lock(handler_mutex_);
+      handler = handlers_.at(channel);
+    }
+    handler(message->data(), message->size(), [](const uint8_t*, size_t) {});
   }
 
   std::atomic<int> off_platform_updates{0};
   std::atomic<int> active_handlers{0};
+  mutable std::atomic<int> off_platform_sends{0};
+  mutable std::atomic<int> sent_events{0};
 
  private:
   std::thread::id platform_thread_ = std::this_thread::get_id();
+  std::mutex handler_mutex_;
+  std::map<std::string, flutter::BinaryMessageHandler> handlers_;
 };
 
 class TestTextureRegistrar : public flutter::TextureRegistrar {
@@ -305,6 +333,30 @@ TEST(VlcPlayerLifecycle, ShutdownDrainsPendingCreateOnPlatformThread) {
   EXPECT_EQ(creation->error, "player_not_found");
   EXPECT_EQ(registrar.unregistered, 1);
   EXPECT_EQ(messenger.off_platform_updates, 0);
+  EXPECT_EQ(messenger.active_handlers, 0);
+}
+
+TEST(VlcPlayerLifecycle, PollingPlaybackEventsStayOnPlatformThread) {
+  TestMessenger messenger;
+  TestTextureRegistrar registrar;
+  VlcPlayerPlugin plugin(&messenger, &registrar);
+  auto creation = Call(plugin, "create", CreateArguments());
+  ASSERT_TRUE(PumpUntil([&] { return creation->done; }));
+  ASSERT_TRUE(creation->error.empty()) << creation->error;
+  messenger.Listen("vlc_player/events/1");
+  EncodableMap arguments = ViewArguments(1);
+  arguments[EncodableValue("uri")] =
+      EncodableValue(std::string("file:///") + VLC_PLAYER_TEST_MEDIA_PATH);
+  arguments[EncodableValue("autoPlay")] = EncodableValue(true);
+  auto source = Call(plugin, "setSource", arguments);
+  ASSERT_TRUE(source->done);
+  ASSERT_TRUE(source->error.empty()) << source->error;
+  const int immediate_events = messenger.sent_events;
+  ASSERT_TRUE(
+      PumpUntil([&] { return messenger.sent_events > immediate_events; }));
+  EXPECT_EQ(messenger.off_platform_sends, 0);
+  Call(plugin, "dispose", ViewArguments(1));
+  ASSERT_TRUE(PumpUntil([&] { return registrar.unregistered == 1; }));
   EXPECT_EQ(messenger.active_handlers, 0);
 }
 

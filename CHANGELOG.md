@@ -6,6 +6,8 @@
 
 - Moved Windows VLC initialization and teardown off the platform thread while
   keeping Flutter channel cleanup on the platform thread.
+- Delivered Windows playback polling events on the platform thread as required
+  by Flutter's platform channels.
 - Reused a lifecycle worker instead of retaining a thread handle for each
   player creation and disposal, and kept textures alive until Flutter finishes
   unregistering them.
@@ -14,6 +16,7 @@
 
 - Added Windows lifecycle regression coverage for failed initialization,
   overlapping creation and disposal, repeated use, and shutdown.
+- Updated Linux's GoogleTest dependency for compatibility with CMake 4.
 
 ## 2.1.3 - 2026-06-02
 

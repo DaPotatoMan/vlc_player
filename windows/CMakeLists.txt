@@ -195,6 +195,8 @@ add_executable(${TEST_RUNNER}
 )
 apply_standard_settings(${TEST_RUNNER})
 target_compile_definitions(${TEST_RUNNER} PRIVATE VLC_PLAYER_TESTING)
+target_compile_definitions(${TEST_RUNNER} PRIVATE
+  VLC_PLAYER_TEST_MEDIA_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../example/assets/format_fixtures/video.mp4")
 target_include_directories(${TEST_RUNNER} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(${TEST_RUNNER} PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../src/native"

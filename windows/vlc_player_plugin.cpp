@@ -317,13 +317,15 @@ struct WindowsVlcTextureState {
   std::shared_ptr<VlcPlayerCore> core;
 };
 
-class WindowsVlcPlayer {
+class WindowsVlcPlayer : public std::enable_shared_from_this<WindowsVlcPlayer> {
  public:
   WindowsVlcPlayer(int64_t view_id, flutter::BinaryMessenger *messenger,
                    flutter::TextureRegistrar *texture_registrar,
-                   FlutterDesktopMessengerRef messenger_ref)
+                   FlutterDesktopMessengerRef messenger_ref,
+                   WindowsPlayerTaskRunner *task_runner)
       : texture_registrar_(texture_registrar),
         messenger_ref_(messenger_ref),
+        task_runner_(task_runner),
         event_channel_(messenger, "vlc_player/events/" + std::to_string(view_id),
                        &flutter::StandardMethodCodec::GetInstance()) {
     auto stream_handler =
@@ -336,7 +338,7 @@ class WindowsVlcPlayer {
                 std::lock_guard<std::mutex> lock(event_mutex_);
                 event_sink_ = std::move(events);
               }
-              SendSnapshot(false, true);
+              SendSnapshot(true);
               return nullptr;
             },
             [this](const EncodableValue *arguments)
@@ -378,13 +380,17 @@ class WindowsVlcPlayer {
 
     std::atomic_store(&texture_state_->core, core_);
     polling_ = true;
-    polling_thread_ = std::thread([this] {
+    polling_thread_ = std::thread([this, weak = weak_from_this()] {
       std::unique_lock<std::mutex> lock(polling_mutex_);
       while (
           !polling_condition_.wait_for(lock, std::chrono::milliseconds(500),
                                        [this] { return !polling_.load(); })) {
         lock.unlock();
-        SendSnapshot(true);
+        task_runner_->PostPlatformTask([weak] {
+          if (auto player = weak.lock()) {
+            player->SendSnapshot();
+          }
+        });
         lock.lock();
       }
     });
@@ -531,8 +537,9 @@ class WindowsVlcPlayer {
     return error;
   }
 
-  void SendSnapshot(bool lock_messenger = false, bool force = false) {
-    if (disposed_.load() || core_ == nullptr) {
+  void SendSnapshot(bool force = false) {
+    if (flutter_detached_.load() || disposed_.load() || !initialized_.load() ||
+        core_ == nullptr) {
       return;
     }
     {
@@ -589,19 +596,12 @@ class WindowsVlcPlayer {
           EncodableValue(snapshot.error_description);
     }
 
-    if (lock_messenger && messenger_ref_ != nullptr) {
-      FlutterDesktopMessengerLock(messenger_ref_);
-      if (FlutterDesktopMessengerIsAvailable(messenger_ref_)) {
-        event_sink_->Success(EncodableValue(event));
-      }
-      FlutterDesktopMessengerUnlock(messenger_ref_);
-      return;
-    }
     event_sink_->Success(EncodableValue(event));
   }
 
   flutter::TextureRegistrar *texture_registrar_;
   FlutterDesktopMessengerRef messenger_ref_;
+  WindowsPlayerTaskRunner *task_runner_;
   flutter::EventChannel<EncodableValue> event_channel_;
   std::unique_ptr<flutter::EventSink<EncodableValue>> event_sink_;
   std::mutex event_mutex_;
@@ -710,7 +710,8 @@ void VlcPlayerPlugin::HandleMethodCall(
       return;
     }
     auto player = std::make_shared<WindowsVlcPlayer>(
-        view_id, messenger_, texture_registrar_, messenger_ref_);
+        view_id, messenger_, texture_registrar_, messenger_ref_,
+        task_runner_.get());
     if (player->texture_id() == -1) {
       result->Error("create_failed", player->error());
       return;
